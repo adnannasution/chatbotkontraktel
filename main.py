@@ -1,0 +1,577 @@
+import os
+import re
+import json
+import asyncio
+import requests
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.constants import ChatAction
+
+# ─── 1. LOAD CONFIGURATION ────────────────────────────────────────────────────
+load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+DATABASE_URL       = os.getenv("DATABASE_URL", "postgresql://user:password@host:5432/dbname")
+DINOIKI_API_KEY    = os.getenv("DINOIKI_API_KEY", "")
+DINOIKI_URL        = "https://ai.dinoiki.com/v1/chat/completions"
+AI_MODEL           = "gpt-4o"
+
+# ─── 2. STOPWORDS ─────────────────────────────────────────────────────────────
+STOPWORDS = {
+    'apa', 'siapa', 'berapa', 'yang', 'dan', 'atau', 'dari', 'untuk',
+    'dengan', 'adalah', 'ini', 'itu', 'ada', 'tidak', 'bisa', 'mau',
+    'saya', 'kamu', 'dia', 'kami', 'kita', 'mereka', 'semua', 'sudah',
+    'belum', 'sedang', 'akan', 'telah', 'pada', 'di', 'ke', 'oleh',
+    'juga', 'hanya', 'lebih', 'paling', 'sangat', 'banyak', 'sedikit',
+    'tampilkan', 'tunjukkan', 'cari', 'lihat', 'data', 'info', 'informasi',
+    'list', 'daftar', 'total', 'jumlah', 'nilai', 'status', 'semua',
+    'kontrak', 'vendor', 'tagihan', 'dokumen', 'progress', 'bulan', 'tahun'
+}
+
+# ─── 3. DATABASE SCHEMA CONTEXT ───────────────────────────────────────────────
+SCHEMA_CONTEXT = """
+Database PostgreSQL untuk sistem manajemen kontrak kilang minyak. Berikut skema tabel:
+
+TABEL: profiles
+Kolom: id, email, full_name, role (admin/pic/user), password_hash, created_at, updated_at, is_active, id_vendor
+
+TABEL: vendor
+Kolom: id_vendor, nama_vendor, npwp, alamat, pic_nama, pic_kontak, status_vendor (Active/Inactive/Blacklist), score, created_at, updated_at
+
+TABEL: kontrak
+Kolom: id_kontrak, id_vendor, judul_kontrak, no_dokumen_kontrak, no_po_pr, direksi_pekerjaan,
+  tipe_kontrak (Lumpsum/Unit Price/TSA/LTSA/TSA-LTSA), status_kontrak (Pre-KOM/Aktif/Selesai/Terminated),
+  tanggal_spb_diterima, tanggal_terima_dokumen, tanggal_maksimal_kom, tanggal_mulai, tanggal_selesai,
+  sla_kom_hari, estimasi_tanggal_kom, tanggal_kom, kom_terlambat, nilai_awal, durasi_kontrak_hari,
+  progress_plan, progress_actual, aktivitas_saat_ini, kendala, disiplin, tkdn_percentage, tanggal_lkp,
+  has_amendment, no_amandemen, tanggal_amandemen, jenis_amandemen, nilai_kontrak_baru, durasi_amandemen,
+  tanggal_mulai_baru, tanggal_selesai_baru, alasan_perubahan, created_at, updated_at
+
+TABEL: amandemen_kontrak
+Kolom: id_amandemen, id_kontrak, nomor_urut, no_amandemen, tanggal_amandemen, jenis_amandemen,
+  nilai_kontrak_baru, durasi_amandemen, tanggal_mulai_baru, tanggal_selesai_baru, alasan_perubahan,
+  created_at, updated_at
+
+TABEL: tagihan
+Kolom: id_tagihan, id_kontrak, nomor_tagihan, tanggal_tagihan, tipe_kontrak, termin, nilai_tagihan,
+  status_tagihan, memo_required, tanggal_pengiriman_memo, catatan, created_at, updated_at
+
+TABEL: progress_lumpsum
+Kolom: id_progress, id_kontrak, milestone, persen, tanggal_update, created_at
+
+TABEL: progress_unit_price
+Kolom: id_progress, id_kontrak, nama_item, satuan, qty_rencana, qty_aktual, harga_satuan, tanggal_update, created_at
+
+TABEL: monitoring_ltsa
+Kolom: id_log, id_kontrak, tanggal_kunjungan, jenis_layanan (Preventive/Corrective/Standby),
+  durasi_jam, sla_terpenuhi (Yes/No), keterangan, created_at
+
+TABEL: padi
+Kolom: id_padi, no_pembelian, tanggal, judul_pembelian, no_po_pr, nilai, id_vendor, link_pembelian,
+  bagian, status_purchase (BAST), tanggal_bast, tanggal_sa_gr, tanggal_invoice,
+  tanggal_payment_approval, tanggal_paid, catatan_status, created_at, updated_at
+
+TABEL: dokumen_approval
+Kolom: id_dokumen, id_kontrak, tipe_dokumen (Evident/Report/Persetujuan), nama_dokumen,
+  deskripsi_dokumen, status_approval (Pending/Approved/Rejected), catatan_reviewer,
+  uploaded_by, reviewed_by, reviewed_at, created_at, updated_at
+
+Relasi penting:
+- vendor.id_vendor -> kontrak.id_vendor (1 vendor banyak kontrak)
+- kontrak.id_kontrak -> tagihan.id_kontrak
+- kontrak.id_kontrak -> amandemen_kontrak.id_kontrak
+- kontrak.id_kontrak -> progress_lumpsum.id_kontrak
+- kontrak.id_kontrak -> progress_unit_price.id_kontrak
+- kontrak.id_kontrak -> monitoring_ltsa.id_kontrak
+- kontrak.id_kontrak -> dokumen_approval.id_kontrak
+- vendor.id_vendor -> padi.id_vendor
+
+NILAI ENUM & PILIHAN YANG VALID:
+
+1. TIPE KONTRAK: 'Lumpsum', 'Unit Price', 'TSA', 'LTSA', 'TSA/LTSA'
+2. STATUS KONTRAK: 'Pre-KOM', 'Aktif', 'Selesai', 'Terminated'
+3. DISIPLIN: 'Instrumentasi', 'Stationary', 'Electrical', 'Rotating', 'Alat Berat'
+4. DIREKSI PEKERJAAN: 'MA5', 'MA6', 'MA7', 'Workshop'
+5. JENIS AMANDEMEN: 'Nilai', 'Waktu', 'Nilai dan Waktu'
+6. STATUS APPROVAL: 'Pending', 'Approved', 'Rejected'
+7. STATUS VENDOR: 'Active', 'Inactive', 'Blacklist'
+8. JENIS LAYANAN LTSA: 'Preventive', 'Corrective', 'Standby'
+9. STATUS TAGIHAN (urutan tahapan):
+   Punchlist -> BAST/BAPP -> Pengajuan -> BAST I Vendor -> SA -> PA -> Verification -> Payment/Selesai
+"""
+
+# ─── 4. SYSTEM PROMPT ─────────────────────────────────────────────────────────
+BASE_SYSTEM_PROMPT = (
+    "Kamu adalah asisten cerdas untuk sistem manajemen kontrak kilang minyak, "
+    "yang menjawab pertanyaan via Telegram.\n"
+    "Kamu dapat menjawab pertanyaan bisnis dalam Bahasa Indonesia secara natural "
+    "dan mengkonversinya ke query SQL PostgreSQL.\n\n"
+    + SCHEMA_CONTEXT +
+    "\nATURAN QUERY SQL:\n"
+    "1. HANYA boleh generate query SELECT — TIDAK boleh UPDATE, DELETE, INSERT, DROP, ALTER, TRUNCATE\n"
+    "2. TIDAK boleh SELECT * — selalu tentukan kolom yang relevan\n"
+    "3. Selalu gunakan LIMIT maksimal 50 baris\n"
+    "4. Gunakan JOIN yang tepat antar tabel\n"
+    "5. Format angka nilai kontrak dalam format Indonesia (Rp)\n"
+    "\nATURAN INTERPRETASI ENTITAS:\n"
+    "- Jika ada blok 'KONTEKS ENTITAS YANG DITEMUKAN DI DATABASE' -> gunakan langsung, JANGAN minta klarifikasi\n"
+    "- Jika user menyebut nama yang diawali PT/CV/UD -> cari di vendor.nama_vendor\n"
+    "- Jika user menyebut kode seperti MA5, KOM-001 -> cari di direksi_pekerjaan atau no_dokumen_kontrak\n"
+    "- Jika entitas tidak ditemukan di konteks -> baru boleh minta klarifikasi\n"
+    "\nATURAN FORMAT JAWABAN (KHUSUS TELEGRAM — NARASI SAJA):\n"
+    "1. JAWABAN FULL NARASI — JANGAN gunakan tabel HTML, JANGAN format markdown [CHART]\n"
+    "2. Jika hasil lebih dari 10 item, tampilkan ringkasan/highlight saja, maksimal 5-7 poin\n"
+    "3. Gunakan poin-poin dengan tanda • jika data lebih dari satu\n"
+    "4. Tebalkan poin penting dengan *teks* (bold Telegram)\n"
+    "5. Tambahkan emoticon relevan (📋, 💰, 📊, ✅, ⚠️, 🔧, 🏭, 🚨, 🔴, 🟢)\n"
+    "6. Gunakan angka dengan format mudah dibaca (contoh: Rp 1.250.000.000 atau Rp 1,25 M)\n"
+    "7. Jika data panjang, akhiri dengan: _(Menampilkan highlight, tanya lebih spesifik untuk detail)_\n"
+    "8. DETEKSI PERTANYAAN TIDAK PRODUKTIF:\n"
+    "   - 'tampilkan semua', 'list semua', 'dump data' -> tolak sopan, minta pertanyaan lebih spesifik\n"
+    "   - Pertanyaan di luar konteks monitoring kontrak -> jawab: 'Maaf, saya hanya membantu analisis data kontrak kilang.'\n"
+    "   PENGECUALIAN — tetap jawab ramah untuk:\n"
+    "   * Sapaan (halo, selamat pagi, dsb) -> balas ramah\n"
+    "   * Tanya kemampuan AI -> jelaskan apa saja yang bisa dibantu\n"
+    "   * Ucapan terima kasih -> balas sopan\n"
+    "\nFORMAT RESPONS JSON:\n"
+    "Kamu HARUS selalu merespons dalam format JSON seperti ini:\n"
+    "{\n"
+    '  "type": "query" | "clarification" | "narrative" | "error",\n'
+    '  "sql": "query SQL jika type=query, null jika tidak",\n'
+    '  "explanation": "penjelasan singkat apa yang akan dilakukan",\n'
+    '  "narrative_hint": "bagaimana cara menarasikan hasilnya",\n'
+    '  "clarification_question": "pertanyaan klarifikasi jika type=clarification",\n'
+    '  "message": "pesan untuk user dalam format Telegram"\n'
+    "}\n"
+)
+
+# ─── 5. HELPER: CALL AI ────────────────────────────────────────────────────────
+def call_ai(messages: list, max_tokens: int = 1500) -> str:
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DINOIKI_API_KEY}"
+    }
+    payload = {
+        "model": AI_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+    }
+    resp = requests.post(DINOIKI_URL, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+# ─── 6. SMART ENTITY SEARCH ───────────────────────────────────────────────────
+def smart_entity_search(user_message: str) -> str:
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        context   = []
+        found_ids = set()
+
+        words = [w for w in re.findall(r'\b\w{3,}\b', user_message)
+                 if w.lower() not in STOPWORDS]
+        company_patterns = re.findall(
+            r'\b(?:PT|CV|UD|TB|PD)\s+[\w\s]+', user_message, re.IGNORECASE
+        )
+        search_terms = list(set(words + company_patterns))
+
+        for term in search_terms:
+            term = term.strip()
+            if len(term) < 3:
+                continue
+
+            cur.execute("""
+                SELECT id_vendor, nama_vendor, status_vendor, score
+                FROM vendor
+                WHERE nama_vendor ILIKE %s
+                LIMIT 3
+            """, (f'%{term}%',))
+            for v in cur.fetchall():
+                key = f"vendor_{v[0]}"
+                if key not in found_ids:
+                    found_ids.add(key)
+                    context.append(
+                        f"[VENDOR] '{v[1]}' -> id_vendor={v[0]}, "
+                        f"status={v[2]}, score={v[3]}"
+                    )
+
+            cur.execute("""
+                SELECT k.id_kontrak, k.judul_kontrak, k.no_dokumen_kontrak,
+                       k.direksi_pekerjaan, k.status_kontrak, k.tipe_kontrak,
+                       v.nama_vendor
+                FROM kontrak k
+                LEFT JOIN vendor v ON k.id_vendor = v.id_vendor
+                WHERE k.judul_kontrak ILIKE %s
+                   OR k.no_dokumen_kontrak ILIKE %s
+                   OR k.no_po_pr ILIKE %s
+                   OR k.direksi_pekerjaan ILIKE %s
+                LIMIT 3
+            """, (f'%{term}%', f'%{term}%', f'%{term}%', f'%{term}%'))
+            for k in cur.fetchall():
+                key = f"kontrak_{k[0]}"
+                if key not in found_ids:
+                    found_ids.add(key)
+                    context.append(
+                        f"[KONTRAK] '{k[1]}' -> id_kontrak={k[0]}, "
+                        f"doc={k[2]}, direksi={k[3]}, "
+                        f"status={k[4]}, tipe={k[5]}, vendor='{k[6]}'"
+                    )
+
+            cur.execute("""
+                SELECT t.id_tagihan, t.nomor_tagihan, t.status_tagihan,
+                       t.nilai_tagihan, k.judul_kontrak
+                FROM tagihan t
+                LEFT JOIN kontrak k ON t.id_kontrak = k.id_kontrak
+                WHERE t.nomor_tagihan ILIKE %s
+                LIMIT 3
+            """, (f'%{term}%',))
+            for t in cur.fetchall():
+                key = f"tagihan_{t[0]}"
+                if key not in found_ids:
+                    found_ids.add(key)
+                    context.append(
+                        f"[TAGIHAN] '{t[1]}' -> id_tagihan={t[0]}, "
+                        f"status={t[2]}, nilai={t[3]}, kontrak='{t[4]}'"
+                    )
+
+            cur.execute("""
+                SELECT p.id_padi, p.no_pembelian, p.judul_pembelian,
+                       p.nilai, v.nama_vendor
+                FROM padi p
+                LEFT JOIN vendor v ON p.id_vendor = v.id_vendor
+                WHERE p.no_pembelian ILIKE %s
+                   OR p.judul_pembelian ILIKE %s
+                LIMIT 3
+            """, (f'%{term}%', f'%{term}%'))
+            for p in cur.fetchall():
+                key = f"padi_{p[0]}"
+                if key not in found_ids:
+                    found_ids.add(key)
+                    context.append(
+                        f"[PADI] '{p[2]}' -> id_padi={p[0]}, "
+                        f"no_pembelian={p[1]}, nilai={p[3]}, vendor='{p[4]}'"
+                    )
+
+        conn.close()
+
+        if context:
+            result  = "\n\nKONTEKS ENTITAS YANG DITEMUKAN DI DATABASE:\n"
+            result += "(Gunakan informasi ini untuk memahami maksud user tanpa perlu klarifikasi)\n"
+            result += "\n".join(context)
+            return result
+
+        return ""
+
+    except Exception as e:
+        print(f"[ENTITY SEARCH ERROR] {e}")
+        return ""
+
+# ─── 7. SQL VALIDATOR ─────────────────────────────────────────────────────────
+def validate_sql(sql: str) -> tuple:
+    sql_upper = sql.upper().strip()
+
+    dangerous = ["UPDATE", "DELETE", "INSERT", "DROP", "ALTER",
+                 "TRUNCATE", "CREATE", "GRANT", "REVOKE"]
+    for op in dangerous:
+        if re.search(r'\b' + op + r'\b', sql_upper):
+            return False, f"Operasi {op} tidak diizinkan."
+
+    if re.search(r'SELECT\s+\*', sql_upper):
+        return False, "Query SELECT * tidak diizinkan."
+
+    if not re.search(r'\bSELECT\b', sql_upper):
+        return False, "Hanya query SELECT yang diizinkan."
+
+    if "LIMIT" not in sql_upper:
+        sql = sql.rstrip(";") + " LIMIT 50"
+
+    return True, sql
+
+# ─── 8. EXECUTE QUERY ─────────────────────────────────────────────────────────
+def execute_query(sql: str) -> tuple:
+    valid, result = validate_sql(sql)
+    if not valid:
+        return [], []
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(result)
+            rows    = cur.fetchall()
+            columns = [desc[0] for desc in cur.description] if cur.description else []
+            data    = [dict(row) for row in rows]
+        conn.close()
+        return data, columns
+    except Exception as e:
+        print(f"[QUERY ERROR] {e}")
+        return [], []
+
+# ─── 9. FORMAT DATA TO TELEGRAM TEXT ──────────────────────────────────────────
+def format_data_for_tg(data: list, columns: list, original_question: str, narrative_hint: str) -> str:
+    if not data:
+        return "Tidak ditemukan data yang sesuai. 🔍"
+
+    row_count = len(data)
+
+    # Untuk data sedikit: minta AI buatkan narasi
+    if row_count <= 5 and len(columns) <= 6:
+        clean_data = []
+        for row in data:
+            clean_row = {}
+            for k, v in row.items():
+                clean_row[k] = v.isoformat() if hasattr(v, 'isoformat') else v
+            clean_data.append(clean_row)
+
+        try:
+            narrative = call_ai([
+                {
+                    "role": "system",
+                    "content": (
+                        "Kamu adalah asisten laporan bisnis via Telegram. "
+                        "Jawab dalam Bahasa Indonesia yang profesional dan natural. "
+                        "Gunakan format Telegram: *bold* untuk poin penting, • untuk list, emoji relevan. "
+                        "Jangan gunakan tabel HTML. Jika ada nilai uang, format sebagai Rupiah (Rp 1.250.000.000)."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f'Pertanyaan user: "{original_question}"\n'
+                        f"Hint narasi: {narrative_hint}\n"
+                        f"Data hasil query: {json.dumps(clean_data, default=str, ensure_ascii=False)}\n\n"
+                        "Buatkan narasi singkat dalam Bahasa Indonesia yang menjawab pertanyaan tersebut. "
+                        "Maksimal 5 kalimat atau poin."
+                    )
+                }
+            ], max_tokens=600)
+            return narrative
+        except Exception as e:
+            print(f"[NARRATIVE ERROR] {e}")
+
+    # Untuk data banyak: format ringkasan manual
+    lines = [f"📊 *Ditemukan {row_count} data*\n"]
+    display_data = data[:7]
+
+    for row in display_data:
+        parts = []
+        for col in columns[:4]:
+            val = row.get(col)
+            if val is None:
+                continue
+            if hasattr(val, 'isoformat'):
+                val = val.strftime('%d/%m/%Y') if hasattr(val, 'strftime') else val.isoformat()
+            parts.append(f"{col}: {val}")
+        lines.append("• " + " | ".join(parts))
+
+    if row_count > 7:
+        lines.append(f"\n_(Menampilkan 7 dari {row_count} data, tanya lebih spesifik untuk detail)_")
+
+    return "\n".join(lines)
+
+# ─── 10. MEMORY PER USER ──────────────────────────────────────────────────────
+MAX_HISTORY    = 10
+user_histories: dict = {}
+
+def get_history(user_id: int) -> list:
+    return user_histories.get(user_id, [])
+
+def add_history(user_id: int, question: str, answer: str):
+    history = user_histories.get(user_id, [])
+    history.append({"role": "user",      "content": question})
+    history.append({"role": "assistant", "content": answer})
+    if len(history) > MAX_HISTORY * 2:
+        history = history[-(MAX_HISTORY * 2):]
+    user_histories[user_id] = history
+
+def clear_history(user_id: int):
+    user_histories.pop(user_id, None)
+
+# ─── 11. CORE FUNCTION ────────────────────────────────────────────────────────
+def run_query(question: str, user_id: int) -> str:
+    dynamic_context = smart_entity_search(question)
+    system_prompt   = BASE_SYSTEM_PROMPT + dynamic_context
+
+    history  = get_history(user_id)
+    messages = [{"role": "system", "content": system_prompt}]
+    messages += history[-MAX_HISTORY * 2:]
+    messages.append({"role": "user", "content": question})
+
+    try:
+        raw = call_ai(messages, max_tokens=1500)
+
+        json_match = re.search(r'\{[\s\S]*\}', raw)
+        if not json_match:
+            answer = raw
+            add_history(user_id, question, answer)
+            return answer
+
+        parsed        = json.loads(json_match.group())
+        response_type = parsed.get("type", "narrative")
+
+        if response_type == "clarification":
+            answer = parsed.get("clarification_question", parsed.get("message", ""))
+            add_history(user_id, question, answer)
+            return answer
+
+        if response_type == "error":
+            answer = parsed.get("message", "Maaf, terjadi kesalahan dalam memproses pertanyaan Anda.")
+            add_history(user_id, question, answer)
+            return answer
+
+        if response_type == "narrative":
+            answer = parsed.get("message", raw)
+            add_history(user_id, question, answer)
+            return answer
+
+        if response_type == "query" and parsed.get("sql"):
+            sql = parsed["sql"]
+            valid, val_result = validate_sql(sql)
+            if not valid:
+                answer = f"⚠️ Maaf, query tidak valid: {val_result}"
+                add_history(user_id, question, answer)
+                return answer
+
+            data, columns = execute_query(val_result)
+
+            if not data:
+                answer = "🔍 Tidak ditemukan data yang sesuai dengan pertanyaan Anda."
+            else:
+                answer = format_data_for_tg(
+                    data, columns, question,
+                    parsed.get("narrative_hint", "")
+                )
+
+            explanation = parsed.get("explanation", "")
+            if explanation and len(data) > 0:
+                answer = f"_{explanation}_\n\n" + answer
+
+            add_history(user_id, question, answer)
+            return answer
+
+        answer = parsed.get("message", raw)
+        add_history(user_id, question, answer)
+        return answer
+
+    except json.JSONDecodeError:
+        answer = raw
+        add_history(user_id, question, answer)
+        return answer
+    except Exception as e:
+        print(f"[RUN_QUERY ERROR] {e}")
+        return "⚠️ Maaf, terjadi kesalahan sistem. Silakan coba beberapa saat lagi."
+
+# ─── 12. TELEGRAM HANDLERS ────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id  = update.effective_user.id
+    is_group = update.message.chat.type in ("group", "supergroup")
+    clear_history(user_id)
+
+    if is_group:
+        bot_username = (await context.bot.get_me()).username
+        await update.message.reply_text(
+            f"👋 *Halo semua!*\n\n"
+            f"Saya siap membantu analisis data *manajemen kontrak kilang minyak* 🏭\n\n"
+            f"💡 Cara pakai di grup — mention saya:\n"
+            f"`@{bot_username} berapa kontrak aktif di MA5?`\n\n"
+            f"Ketik /reset untuk memulai sesi baru.",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            "👋 *Halo!* Selamat datang di *Bot Manajemen Kontrak Kilang* 🏭\n\n"
+            "Saya dapat membantu Anda:\n"
+            "• 📋 Cek status & detail kontrak\n"
+            "• 💰 Informasi tagihan & pembayaran\n"
+            "• 🏢 Data vendor & performanya\n"
+            "• 📊 Progress pekerjaan & milestone\n"
+            "• 📄 Status dokumen & amandemen\n\n"
+            "💡 *Tips:* Tanyakan analisis atau data spesifik, bukan 'tampilkan semua'.\n\n"
+            "Ketik /reset untuk memulai percakapan baru.",
+            parse_mode='Markdown'
+        )
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    clear_history(user_id)
+    await update.message.reply_text(
+        "🔄 *Percakapan direset.* Memori sesi sebelumnya dihapus.",
+        parse_mode='Markdown'
+    )
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Panduan Bot Kontrak Kilang*\n\n"
+        "*Contoh pertanyaan:*\n"
+        "• Kontrak apa saja yang aktif di MA5?\n"
+        "• Berapa nilai kontrak PT ABC?\n"
+        "• Tagihan mana yang belum dibayar?\n"
+        "• Progress kontrak nomor KOM-001?\n"
+        "• Vendor mana yang punya kontrak Lumpsum?\n"
+        "• Amandemen kontrak bulan ini?\n\n"
+        "*Perintah:*\n"
+        "/start — Salam pembuka\n"
+        "/reset — Hapus memori percakapan\n"
+        "/help  — Tampilkan panduan ini",
+        parse_mode='Markdown'
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_id  = update.effective_user.id
+    text     = update.message.text.strip()
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    # ── Di grup: hanya proses jika di-mention ─────────────────────────────────
+    if is_group:
+        bot_username = (await context.bot.get_me()).username
+        mention      = f"@{bot_username}"
+        if mention not in text:
+            return
+        question = text.replace(mention, "").strip()
+        if not question:
+            await update.message.reply_text(
+                f"👋 Silakan ajukan pertanyaan setelah mention saya.\n"
+                f"Contoh: *{mention} berapa kontrak aktif di MA5?*",
+                parse_mode='Markdown'
+            )
+            return
+    else:
+        question = text
+
+    # ── Kirim "typing..." indicator ───────────────────────────────────────────
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    # ── Proses di executor agar tidak block event loop ─────────────────────────
+    loop   = asyncio.get_event_loop()
+    answer = await loop.run_in_executor(None, run_query, question, user_id)
+
+    # Telegram punya batas 4096 karakter per pesan
+    if len(answer) > 4096:
+        answer = answer[:4000] + "\n\n_...(pesan terpotong, tanya lebih spesifik)_"
+
+    try:
+        await update.message.reply_text(answer, parse_mode='Markdown')
+    except Exception:
+        # Fallback tanpa Markdown kalau ada karakter bermasalah
+        await update.message.reply_text(answer)
+
+# ─── 13. RUN ──────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ Error: TELEGRAM_BOT_TOKEN belum diset!")
+    else:
+        print("🚀 Bot Telegram Kontrak Kilang berjalan...")
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("reset", cmd_reset))
+        app.add_handler(CommandHandler("help",  cmd_help))
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+        app.run_polling()
