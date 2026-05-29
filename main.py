@@ -47,7 +47,8 @@ Kolom: id_kontrak, id_vendor, judul_kontrak, no_dokumen_kontrak, no_po_pr, direk
   sla_kom_hari, estimasi_tanggal_kom, tanggal_kom, kom_terlambat, nilai_awal, durasi_kontrak_hari,
   progress_plan, progress_actual, aktivitas_saat_ini, kendala, disiplin, tkdn_percentage, tanggal_lkp,
   has_amendment, no_amandemen, tanggal_amandemen, jenis_amandemen, nilai_kontrak_baru, durasi_amandemen,
-  tanggal_mulai_baru, tanggal_selesai_baru, alasan_perubahan, created_at, updated_at
+  tanggal_mulai_baru, tanggal_selesai_baru, alasan_perubahan, tanggal_mpl, tanggal_mpa,
+  masa_pemeliharaan_hari, created_at, updated_at
 
 TABEL: amandemen_kontrak
 Kolom: id_amandemen, id_kontrak, nomor_urut, no_amandemen, tanggal_amandemen, jenis_amandemen,
@@ -78,6 +79,12 @@ Kolom: id_dokumen, id_kontrak, tipe_dokumen (Evident/Report/Persetujuan), nama_d
   deskripsi_dokumen, status_approval (Pending/Approved/Rejected), catatan_reviewer,
   uploaded_by, reviewed_by, reviewed_at, created_at, updated_at
 
+TABEL: daily_report
+Kolom: id_report, tanggal_laporan, disiplin (Electrical/Instrument/Rotating/Stationary/Alat Berat),
+  direksi (MA5/MA6/MA7/Workshop), kategori (Corrective Maintenance/Preventive Maintenance/Plant Patrol/Progress/Challenge Session),
+  tag_number, deskripsi, status_pekerjaan (Done/In Progress/Waiting Material/Pending/-),
+  catatan, pengirim_wa, raw_text, created_at
+
 Relasi penting:
 - vendor.id_vendor -> kontrak.id_vendor (1 vendor banyak kontrak)
 - kontrak.id_kontrak -> tagihan.id_kontrak
@@ -99,7 +106,7 @@ NILAI ENUM & PILIHAN YANG VALID:
 7. STATUS VENDOR: 'Active', 'Inactive', 'Blacklist'
 8. JENIS LAYANAN LTSA: 'Preventive', 'Corrective', 'Standby'
 9. STATUS TAGIHAN (urutan tahapan):
-   Punchlist -> BAST/BAPP -> Pengajuan -> BAST I Vendor -> SA -> PA -> Verification -> Payment/Selesai
+   LKP -> Punchlist -> BAST -> BAKP/BAPP -> Submit i-Vendor -> SA -> PA -> Verification -> Payment/Selesai
 """
 
 # ─── 4. SYSTEM PROMPT ─────────────────────────────────────────────────────────
@@ -316,7 +323,6 @@ def format_data_for_tg(data: list, columns: list, original_question: str, narrat
 
     row_count = len(data)
 
-    # Untuk data sedikit: minta AI buatkan narasi
     if row_count <= 5 and len(columns) <= 6:
         clean_data = []
         for row in data:
@@ -351,7 +357,6 @@ def format_data_for_tg(data: list, columns: list, original_question: str, narrat
         except Exception as e:
             print(f"[NARRATIVE ERROR] {e}")
 
-    # Untuk data banyak: format ringkasan manual
     lines = [f"📊 *Ditemukan {row_count} data*\n"]
     display_data = data[:7]
 
@@ -388,6 +393,131 @@ def add_history(user_id: int, question: str, answer: str):
 
 def clear_history(user_id: int):
     user_histories.pop(user_id, None)
+
+# ─── 10b. FITUR #LAPORAN ──────────────────────────────────────────────────────
+
+LAPORAN_SYSTEM_PROMPT = (
+    "Kamu adalah parser laporan harian maintenance kilang minyak.\n"
+    "Tugasmu mengekstrak data dari teks laporan narasi ke dalam format JSON terstruktur.\n\n"
+    "DISIPLIN YANG VALID: Electrical, Instrument, Rotating, Stationary, Alat Berat\n\n"
+    "KATEGORI YANG VALID:\n"
+    "- Corrective Maintenance\n"
+    "- Preventive Maintenance\n"
+    "- Plant Patrol\n"
+    "- Progress\n"
+    "- Challenge Session\n\n"
+    "STATUS YANG VALID: Done, In Progress, Waiting Material, Pending, -\n\n"
+    "DIREKSI (area kerja, sama dengan Bagian) YANG VALID: MA5, MA6, MA7, Workshop\n"
+    "Normalisasi: 'Maintenance Area 7' / 'Area 7' / 'MA 7' / 'Bagian 7' → 'MA7'\n"
+    "             'Maintenance Area 5' / 'Area 5' / 'MA 5' / 'Bagian 5' → 'MA5'\n"
+    "             'Maintenance Area 6' / 'Area 6' / 'MA 6' / 'Bagian 6' → 'MA6'\n"
+    "             'Workshop' → 'Workshop'\n"
+    "Jika tidak ada informasi direksi, gunakan string kosong.\n\n"
+    "TAG NUMBER: Kode identifikasi equipment/alat yang biasanya ada di awal deskripsi item,\n"
+    "dipisah dengan titik dua (:) atau spasi. Contoh: 101-P-105, 104-P-107, 101A514, 105-FV-020.\n"
+    "Format umum: [area]-[tipe]-[nomor] atau [area][kode][nomor].\n"
+    "Jika tidak ada tag number, gunakan string kosong.\n\n"
+    "ATURAN EKSTRAKSI:\n"
+    "1. Satu item pekerjaan = satu entri JSON\n"
+    "2. Deteksi tanggal dari teks laporan (format DD/MM/YYYY, DD Bulan YYYY, dsb)\n"
+    "3. Deteksi disiplin dari header laporan\n"
+    "4. Deteksi direksi dari header laporan, normalisasi ke MA5/MA6/MA7/Workshop\n"
+    "5. Petakan setiap item ke kategori yang sesuai\n"
+    "6. Ekstrak status dari keterangan (Done, In Progress, Waiting Material, dll)\n"
+    "7. Jika status tidak disebut, gunakan -\n"
+    "8. Catatan: info tambahan yang relevan (target tanggal, detail teknis, dll)\n"
+    "9. Ekstrak tag number dari awal deskripsi item jika ada\n"
+    "10. Deskripsi diisi tanpa tag number (tag number sudah dipisah di field tag_number)\n\n"
+    "RESPONSE FORMAT — kembalikan HANYA array JSON, tanpa teks lain:\n"
+    '[\n  {\n    "tanggal_laporan": "2026-05-26",\n    "disiplin": "Instrument",\n'
+    '    "direksi": "MA7",\n    "kategori": "Plant Patrol",\n    "tag_number": "105-FV-020",\n'
+    '    "deskripsi": "Plant Patrol control valve",\n'
+    '    "status_pekerjaan": "Done",\n    "catatan": ""\n  }\n]\n\n'
+    "PENTING: Kembalikan HANYA array JSON yang valid. Jangan tambahkan penjelasan apapun."
+)
+
+def parse_laporan_with_ai(raw_text: str) -> list:
+    try:
+        response = call_ai([
+            {"role": "system", "content": LAPORAN_SYSTEM_PROMPT},
+            {"role": "user",   "content": f"Parse laporan berikut:\n\n{raw_text}"}
+        ], max_tokens=2000)
+
+        json_match = re.search(r'\[[\s\S]*\]', response)
+        if not json_match:
+            print(f"[PARSE LAPORAN] Tidak ada JSON array: {response[:200]}")
+            return []
+
+        parsed = json.loads(json_match.group())
+        return parsed if isinstance(parsed, list) else []
+
+    except Exception as e:
+        print(f"[PARSE LAPORAN ERROR] {e}")
+        return []
+
+def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
+    if not items:
+        return 0, "Tidak ada item yang bisa diparse"
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        success = 0
+        for item in items:
+            if not item.get("tanggal_laporan") or not item.get("disiplin") or not item.get("deskripsi"):
+                continue
+            cur.execute("""
+                INSERT INTO daily_report
+                    (tanggal_laporan, disiplin, direksi, kategori, tag_number, deskripsi,
+                     status_pekerjaan, catatan, pengirim_wa, raw_text)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                item.get("tanggal_laporan"),
+                item.get("disiplin", "-"),
+                item.get("direksi", ""),
+                item.get("kategori", "-"),
+                item.get("tag_number", ""),
+                item.get("deskripsi", "-"),
+                item.get("status_pekerjaan", "-"),
+                item.get("catatan", ""),
+                pengirim,
+                raw_text
+            ))
+            success += 1
+        conn.commit()
+        conn.close()
+        return success, None
+    except Exception as e:
+        print(f"[INSERT LAPORAN ERROR] {e}")
+        return 0, str(e)
+
+def process_laporan(raw_text: str, pengirim: str) -> str:
+    print(f"[LAPORAN] Memproses dari {pengirim}, panjang: {len(raw_text)} karakter")
+    items = parse_laporan_with_ai(raw_text)
+    if not items:
+        return (
+            "⚠️ *Gagal memparse laporan.*\n\n"
+            "Pastikan format laporan sudah benar:\n"
+            "• Ada tanggal (contoh: 26 Mei 2026)\n"
+            "• Ada disiplin (Electrical/Instrument/Rotating/dll)\n"
+            "• Ada daftar pekerjaan\n\n"
+            "Coba kirim ulang dengan format yang lebih jelas."
+        )
+    success_count, error = insert_daily_report(items, pengirim, raw_text)
+    if error:
+        return f"⚠️ *Gagal menyimpan laporan:* {error}"
+    if success_count == 0:
+        return "⚠️ *Tidak ada data yang berhasil disimpan.* Periksa format laporan."
+    summary = {}
+    for item in items[:success_count]:
+        key = f"{item.get('disiplin', '-')} - {item.get('kategori', '-')}"
+        summary[key] = summary.get(key, 0) + 1
+    summary_lines = "\n".join([f"  • {k}: {v} item" for k, v in summary.items()])
+    return (
+        f"✅ *Laporan berhasil disimpan!*\n\n"
+        f"📋 *Total:* {success_count} kegiatan tercatat\n\n"
+        f"*Rincian:*\n{summary_lines}\n\n"
+        f"_Data tersimpan di database dan bisa ditanyakan kapan saja._"
+    )
 
 # ─── 11. CORE FUNCTION ────────────────────────────────────────────────────────
 def run_query(question: str, user_id: int) -> str:
@@ -476,6 +606,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Saya siap membantu analisis data *manajemen kontrak kilang minyak* 🏭\n\n"
             f"💡 Cara pakai di grup — mention saya:\n"
             f"`@{bot_username} berapa kontrak aktif di MA5?`\n\n"
+            f"Kirim *#laporan* diikuti isi laporan untuk menyimpan laporan harian.\n\n"
             f"Ketik /reset untuk memulai sesi baru.",
             parse_mode='Markdown'
         )
@@ -487,7 +618,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 💰 Informasi tagihan & pembayaran\n"
             "• 🏢 Data vendor & performanya\n"
             "• 📊 Progress pekerjaan & milestone\n"
-            "• 📄 Status dokumen & amandemen\n\n"
+            "• 📄 Status dokumen & amandemen\n"
+            "• 📝 Simpan laporan harian dengan *#laporan*\n\n"
             "💡 *Tips:* Tanyakan analisis atau data spesifik, bukan 'tampilkan semua'.\n\n"
             "Ketik /reset untuk memulai percakapan baru.",
             parse_mode='Markdown'
@@ -510,7 +642,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Tagihan mana yang belum dibayar?\n"
         "• Progress kontrak nomor KOM-001?\n"
         "• Vendor mana yang punya kontrak Lumpsum?\n"
-        "• Amandemen kontrak bulan ini?\n\n"
+        "• Amandemen kontrak bulan ini?\n"
+        "• Laporan Rotating hari ini?\n\n"
+        "*Kirim Laporan Harian:*\n"
+        "#laporan [isi laporan]\n"
+        "Contoh:\n"
+        "`#laporan Pekerjaan Rotating MA7 26 Mei 2026`\n"
+        "`Corrective Maintenance`\n"
+        "`1. 101-P-103: Perbaikan koneksi SAF (done)`\n\n"
         "*Perintah:*\n"
         "/start — Salam pembuka\n"
         "/reset — Hapus memori percakapan\n"
@@ -525,23 +664,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id  = update.effective_user.id
     text     = update.message.text.strip()
     is_group = update.message.chat.type in ("group", "supergroup")
+    pengirim = str(update.effective_user.id)
 
     # ── Di grup: hanya proses jika di-mention ─────────────────────────────────
     if is_group:
         bot_username = (await context.bot.get_me()).username
         mention      = f"@{bot_username}"
         if mention not in text:
-            return
-        question = text.replace(mention, "").strip()
-        if not question:
+            # Cek #laporan di grup tanpa perlu mention
+            if not any(text.lower().startswith(t) for t in ["#laporan", "#report", "#lpr"]):
+                return
+            question = text
+        else:
+            question = text.replace(mention, "").strip()
+            if not question:
+                await update.message.reply_text(
+                    f"👋 Silakan ajukan pertanyaan setelah mention saya.\n"
+                    f"Contoh: *{mention} berapa kontrak aktif di MA5?*",
+                    parse_mode='Markdown'
+                )
+                return
+    else:
+        question = text
+
+    # ── Deteksi #laporan ───────────────────────────────────────────────────────
+    LAPORAN_TRIGGERS = ["#laporan", "#report", "#lpr"]
+    matched_laporan  = None
+    for trigger in LAPORAN_TRIGGERS:
+        if question.lower().startswith(trigger):
+            matched_laporan = trigger
+            break
+
+    if matched_laporan:
+        laporan_text = question[len(matched_laporan):].strip()
+        if not laporan_text:
             await update.message.reply_text(
-                f"👋 Silakan ajukan pertanyaan setelah mention saya.\n"
-                f"Contoh: *{mention} berapa kontrak aktif di MA5?*",
+                "📋 *Format pengiriman laporan:*\n\n"
+                "*#laporan* [isi laporan]\n\n"
+                "Contoh:\n"
+                "`#laporan Pekerjaan Rotating MA7 26 Mei 2026`\n"
+                "`Corrective Maintenance`\n"
+                "`1. 101-P-103: Perbaikan koneksi SAF (done)`",
                 parse_mode='Markdown'
             )
             return
-    else:
-        question = text
+
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING
+        )
+        loop   = asyncio.get_event_loop()
+        answer = await loop.run_in_executor(None, process_laporan, laporan_text, pengirim)
+
+        try:
+            await update.message.reply_text(answer, parse_mode='Markdown')
+        except Exception:
+            await update.message.reply_text(answer)
+        return
 
     # ── Kirim "typing..." indicator ───────────────────────────────────────────
     await context.bot.send_chat_action(
@@ -549,18 +728,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action=ChatAction.TYPING
     )
 
-    # ── Proses di executor agar tidak block event loop ─────────────────────────
+    # ── Proses query di executor ───────────────────────────────────────────────
     loop   = asyncio.get_event_loop()
     answer = await loop.run_in_executor(None, run_query, question, user_id)
 
-    # Telegram punya batas 4096 karakter per pesan
     if len(answer) > 4096:
         answer = answer[:4000] + "\n\n_...(pesan terpotong, tanya lebih spesifik)_"
 
     try:
         await update.message.reply_text(answer, parse_mode='Markdown')
     except Exception:
-        # Fallback tanpa Markdown kalau ada karakter bermasalah
         await update.message.reply_text(answer)
 
 # ─── 13. RUN ──────────────────────────────────────────────────────────────────
