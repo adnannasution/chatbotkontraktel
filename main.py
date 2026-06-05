@@ -436,24 +436,147 @@ LAPORAN_SYSTEM_PROMPT = (
     "PENTING: Kembalikan HANYA array JSON yang valid. Jangan tambahkan penjelasan apapun."
 )
 
-def parse_laporan_with_ai(raw_text: str) -> list:
+def extract_laporan_header(raw_text: str) -> dict:
+    """
+    Ekstrak header laporan (tanggal, disiplin, direksi) secara regex
+    tanpa perlu AI — cepat dan hemat token.
+    """
+    header = {"tanggal": "", "disiplin": "", "direksi": ""}
+
+    # ── Tanggal ────────────────────────────────────────────────────────────────
+    BULAN_MAP = {
+        "januari": "01", "februari": "02", "maret": "03", "april": "04",
+        "mei": "05", "juni": "06", "juli": "07", "agustus": "08",
+        "september": "09", "oktober": "10", "november": "11", "desember": "12"
+    }
+    # Pola DD/MM/YYYY atau DD-MM-YYYY
+    m = re.search(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b', raw_text)
+    if m:
+        header["tanggal"] = f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+    else:
+        # Pola "03 Juni 2026" / "3 juni 2026"
+        m = re.search(
+            r'\b(\d{1,2})\s+(' + '|'.join(BULAN_MAP.keys()) + r')\s+(\d{4})\b',
+            raw_text, re.IGNORECASE
+        )
+        if m:
+            bln = BULAN_MAP[m.group(2).lower()]
+            header["tanggal"] = f"{m.group(3)}-{bln}-{m.group(1).zfill(2)}"
+
+    # ── Disiplin ───────────────────────────────────────────────────────────────
+    DISIPLIN_LIST = ["Electrical", "Instrument", "Rotating", "Stationary", "Alat Berat"]
+    for d in DISIPLIN_LIST:
+        if re.search(r'\b' + d + r'\b', raw_text, re.IGNORECASE):
+            header["disiplin"] = d
+            break
+
+    # ── Direksi / Area ────────────────────────────────────────────────────────
+    DIREKSI_MAP = {
+        r'\bMA\s*7\b': "MA7", r'\bMA\s*6\b': "MA6", r'\bMA\s*5\b': "MA5",
+        r'[Mm]aintenance\s+[Aa]rea\s*7': "MA7",
+        r'[Mm]aintenance\s+[Aa]rea\s*6': "MA6",
+        r'[Mm]aintenance\s+[Aa]rea\s*5': "MA5",
+        r'\bWorkshop\b': "Workshop",
+    }
+    for pattern, val in DIREKSI_MAP.items():
+        if re.search(pattern, raw_text):
+            header["direksi"] = val
+            break
+
+    return header
+
+
+def split_laporan_to_chunks(raw_text: str) -> list:
+    """
+    Potong teks laporan per section/kategori agar tiap chunk kecil
+    dan AI tidak 'lupa' item di tengah proses parsing.
+    Mengembalikan list of (header_text, chunk_text).
+    """
+    CATEGORY_KEYWORDS = [
+        "Plant Patrol", "Preventive Maintenance", "Corrective Maintenance",
+        "Progress", "Challenge Session", "Project"
+    ]
+    # Hanya match di awal baris (setelah newline atau awal teks)
+    pattern = r'(?:(?<=\n)|(?<=\r\n)|(?:^))(?=' + '|'.join(re.escape(k) for k in CATEGORY_KEYWORDS) + r')'
+    parts = re.split(pattern, raw_text, flags=re.IGNORECASE | re.MULTILINE)
+
+    header_lines = []
+    chunks = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        is_category = any(
+            part.lower().startswith(k.lower()) for k in CATEGORY_KEYWORDS
+        )
+        if is_category:
+            chunks.append(part)
+        else:
+            header_lines.append(part)
+
+    header_text = "\n".join(header_lines)
+
+    if not chunks:
+        # Tidak ada kategori ditemukan — kirim seluruhnya sebagai 1 chunk
+        return [(header_text, raw_text)]
+
+    return [(header_text, chunk) for chunk in chunks]
+
+
+def parse_chunk_with_ai(header_text: str, chunk_text: str) -> list:
+    """Parse satu chunk (satu kategori) dengan AI."""
+    combined = f"{header_text}\n\n{chunk_text}" if header_text else chunk_text
     try:
         response = call_ai([
             {"role": "system", "content": LAPORAN_SYSTEM_PROMPT},
-            {"role": "user",   "content": f"Parse laporan berikut:\n\n{raw_text}"}
-        ], max_tokens=2000)
+            {"role": "user",   "content": f"Parse laporan berikut:\n\n{combined}"}
+        ], max_tokens=3000)
 
         json_match = re.search(r'\[[\s\S]*\]', response)
         if not json_match:
-            print(f"[PARSE LAPORAN] Tidak ada JSON array: {response[:200]}")
+            print(f"[PARSE CHUNK] Tidak ada JSON: {response[:200]}")
             return []
 
         parsed = json.loads(json_match.group())
         return parsed if isinstance(parsed, list) else []
 
     except Exception as e:
-        print(f"[PARSE LAPORAN ERROR] {e}")
+        print(f"[PARSE CHUNK ERROR] {e}")
         return []
+
+
+def parse_laporan_with_ai(raw_text: str) -> list:
+    """
+    Parse laporan dengan chunking otomatis per kategori.
+    Setiap kategori diparse terpisah lalu digabungkan.
+    """
+    chunks = split_laporan_to_chunks(raw_text)
+    print(f"[PARSE LAPORAN] Total chunks: {len(chunks)}")
+
+    all_items = []
+    for i, (header_text, chunk_text) in enumerate(chunks):
+        print(f"[PARSE LAPORAN] Memproses chunk {i+1}/{len(chunks)}: "
+              f"{chunk_text[:60].strip()!r}...")
+        items = parse_chunk_with_ai(header_text, chunk_text)
+        print(f"[PARSE LAPORAN] Chunk {i+1} → {len(items)} item")
+        all_items.extend(items)
+
+    # Deduplikasi berdasarkan kombinasi tanggal+disiplin+deskripsi
+    seen = set()
+    unique_items = []
+    for item in all_items:
+        key = (
+            item.get("tanggal_laporan", ""),
+            item.get("disiplin", ""),
+            item.get("deskripsi", "").strip().lower()
+        )
+        if key not in seen:
+            seen.add(key)
+            unique_items.append(item)
+
+    print(f"[PARSE LAPORAN] Total item unik: {len(unique_items)}")
+    return unique_items
+
 
 def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
     if not items:
@@ -490,32 +613,50 @@ def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
         print(f"[INSERT LAPORAN ERROR] {e}")
         return 0, str(e)
 
+
 def process_laporan(raw_text: str, pengirim: str) -> str:
     print(f"[LAPORAN] Memproses dari {pengirim}, panjang: {len(raw_text)} karakter")
+
+    # Ekstrak header dulu untuk info ke user
+    header   = extract_laporan_header(raw_text)
+    chunks   = split_laporan_to_chunks(raw_text)
+    n_chunks = len(chunks)
+
     items = parse_laporan_with_ai(raw_text)
     if not items:
         return (
             "⚠️ *Gagal memparse laporan.*\n\n"
             "Pastikan format laporan sudah benar:\n"
-            "• Ada tanggal (contoh: 26 Mei 2026)\n"
-            "• Ada disiplin (Electrical/Instrument/Rotating/dll)\n"
-            "• Ada daftar pekerjaan\n\n"
+            "• Ada tanggal (contoh: 03/06/2026 atau 3 Juni 2026)\n"
+            "• Ada disiplin (Electrical/Instrument/Rotating/Stationary/Alat Berat)\n"
+            "• Ada kategori pekerjaan (Plant Patrol / Preventive / Corrective / Project)\n"
+            "• Ada daftar item pekerjaan bernomor\n\n"
             "Coba kirim ulang dengan format yang lebih jelas."
         )
+
     success_count, error = insert_daily_report(items, pengirim, raw_text)
     if error:
         return f"⚠️ *Gagal menyimpan laporan:* {error}"
     if success_count == 0:
         return "⚠️ *Tidak ada data yang berhasil disimpan.* Periksa format laporan."
+
+    # Ringkasan per kategori
     summary = {}
     for item in items[:success_count]:
-        key = f"{item.get('disiplin', '-')} - {item.get('kategori', '-')}"
+        key = f"{item.get('disiplin', '-')} — {item.get('kategori', '-')}"
         summary[key] = summary.get(key, 0) + 1
     summary_lines = "\n".join([f"  • {k}: {v} item" for k, v in summary.items()])
+
+    # Info tanggal & area dari header
+    tgl_info   = f"📅 *Tanggal:* {header['tanggal']}\n" if header["tanggal"] else ""
+    area_info  = f"🏭 *Area:* {header['direksi']} — {header['disiplin']}\n" if header["direksi"] else ""
+    chunk_info = f"🔀 *Diproses dalam:* {n_chunks} bagian\n" if n_chunks > 1 else ""
+
     return (
         f"✅ *Laporan berhasil disimpan!*\n\n"
+        f"{tgl_info}{area_info}{chunk_info}\n"
         f"📋 *Total:* {success_count} kegiatan tercatat\n\n"
-        f"*Rincian:*\n{summary_lines}\n\n"
+        f"*Rincian per kategori:*\n{summary_lines}\n\n"
         f"_Data tersimpan di database dan bisa ditanyakan kapan saja._"
     )
 
