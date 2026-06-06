@@ -405,9 +405,16 @@ LAPORAN_SYSTEM_PROMPT = (
     "- Preventive Maintenance\n"
     "- Plant Patrol\n"
     "- Progress\n"
-    "- Challenge Session\n\n"
-    "STATUS YANG VALID: Done, In Progress, Waiting Material, Pending, -\n\n"
-    "DIREKSI (area kerja, sama dengan Bagian) YANG VALID: MA5, MA6, MA7, Workshop\n"
+    "- Challenge Session\n"
+    "- Support\n\n"
+    "STATUS YANG VALID: Done, In Progress, Waiting Material, Pending, -\n"
+    "MAPPING STATUS (terapkan tepat seperti ini):\n"
+    "  (done), DONE, Done, selesai → Done\n"
+    "  (ip), (in progress), In Progress, in progress, sedang dikerjakan → In Progress\n"
+    "  waiting material, wm → Waiting Material\n"
+    "  pending → Pending\n"
+    "  Jika tidak ada keterangan status → -\n\n"
+    "DIREKSI (area kerja) YANG VALID: MA5, MA6, MA7, Workshop\n"
     "Normalisasi: 'Maintenance Area 7' / 'Area 7' / 'MA 7' / 'Bagian 7' → 'MA7'\n"
     "             'Maintenance Area 5' / 'Area 5' / 'MA 5' / 'Bagian 5' → 'MA5'\n"
     "             'Maintenance Area 6' / 'Area 6' / 'MA 6' / 'Bagian 6' → 'MA6'\n"
@@ -423,11 +430,18 @@ LAPORAN_SYSTEM_PROMPT = (
     "3. Deteksi disiplin dari header laporan\n"
     "4. Deteksi direksi dari header laporan, normalisasi ke MA5/MA6/MA7/Workshop\n"
     "5. Petakan setiap item ke kategori yang sesuai\n"
-    "6. Ekstrak status dari keterangan (Done, In Progress, Waiting Material, dll)\n"
-    "7. Jika status tidak disebut, gunakan -\n"
-    "8. Catatan: info tambahan yang relevan (target tanggal, detail teknis, dll)\n"
-    "9. Ekstrak tag number dari awal deskripsi item jika ada\n"
-    "10. Deskripsi diisi tanpa tag number (tag number sudah dipisah di field tag_number)\n\n"
+    "6. Ekstrak status menggunakan MAPPING STATUS di atas\n"
+    "7. Ekstrak tag number dari awal deskripsi item jika ada\n"
+    "8. Deskripsi diisi tanpa tag number (tag number sudah dipisah di field tag_number)\n"
+    "9. Catatan: info tambahan yang relevan (target tanggal, detail teknis, dll)\n\n"
+    "ATURAN MULTI-TAG (penting):\n"
+    "Jika satu baris menyebut beberapa tag sekaligus, buat SATU entri per tag.\n"
+    "Contoh: 'Perbaikan fireproofing: 105-P-506, 105-P-508, 105-P-507 (in progress)'\n"
+    "→ 3 entri terpisah, masing-masing dengan tag berbeda, deskripsi & status sama.\n\n"
+    "ATURAN ABAIKAN BARIS BERIKUT (jangan buat entri JSON):\n"
+    "- Baris template/placeholder, contoh: 'Tag Number/Equipment/Func. Loc: Aktifitas (status)', '...', '..'\n"
+    "- Baris sub-header equipment, contoh: '* Equipment : Transmitter', '* Equipment : Junction Box'\n"
+    "- Baris kosong atau hanya berisi tanda baca\n\n"
     "RESPONSE FORMAT — kembalikan HANYA array JSON, tanpa teks lain:\n"
     '[\n  {\n    "tanggal_laporan": "2026-05-26",\n    "disiplin": "Instrument",\n'
     '    "direksi": "MA7",\n    "kategori": "Plant Patrol",\n    "tag_number": "105-FV-020",\n'
@@ -436,12 +450,36 @@ LAPORAN_SYSTEM_PROMPT = (
     "PENTING: Kembalikan HANYA array JSON yang valid. Jangan tambahkan penjelasan apapun."
 )
 
+# ── Pola untuk filter entri sampah post-parse ──────────────────────────────────
+PLACEHOLDER_PATTERNS = [
+    r'^tag\s*number',
+    r'^func.*loc',
+    r'^\.*$',
+    r'^aktifitas',
+    r'^\s*\.\.\.*\s*$',
+]
+
+def is_junk_entry(item: dict) -> bool:
+    """Return True kalau entri ini template/placeholder/sampah."""
+    deskripsi  = item.get("deskripsi",  "").strip().lower()
+    tag_number = item.get("tag_number", "").strip().lower()
+    combined   = f"{tag_number} {deskripsi}".strip()
+    for pat in PLACEHOLDER_PATTERNS:
+        if re.search(pat, combined, re.IGNORECASE):
+            return True
+    # Entri tanpa deskripsi DAN tanpa tag → sampah
+    if not deskripsi and not tag_number:
+        return True
+    return False
+
+
 def extract_laporan_header(raw_text: str) -> dict:
     """
-    Ekstrak header laporan (tanggal, disiplin, direksi) secara regex
+    Ekstrak header laporan (tanggal, semua disiplin, direksi) secara regex
     tanpa perlu AI — cepat dan hemat token.
+    disiplin sekarang berupa list (bisa lebih dari satu).
     """
-    header = {"tanggal": "", "disiplin": "", "direksi": ""}
+    header = {"tanggal": "", "disiplin": [], "direksi": ""}
 
     # ── Tanggal ────────────────────────────────────────────────────────────────
     BULAN_MAP = {
@@ -449,12 +487,10 @@ def extract_laporan_header(raw_text: str) -> dict:
         "mei": "05", "juni": "06", "juli": "07", "agustus": "08",
         "september": "09", "oktober": "10", "november": "11", "desember": "12"
     }
-    # Pola DD/MM/YYYY atau DD-MM-YYYY
     m = re.search(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b', raw_text)
     if m:
         header["tanggal"] = f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
     else:
-        # Pola "03 Juni 2026" / "3 juni 2026"
         m = re.search(
             r'\b(\d{1,2})\s+(' + '|'.join(BULAN_MAP.keys()) + r')\s+(\d{4})\b',
             raw_text, re.IGNORECASE
@@ -463,14 +499,17 @@ def extract_laporan_header(raw_text: str) -> dict:
             bln = BULAN_MAP[m.group(2).lower()]
             header["tanggal"] = f"{m.group(3)}-{bln}-{m.group(1).zfill(2)}"
 
-    # ── Disiplin ───────────────────────────────────────────────────────────────
+    # ── Disiplin — kumpulkan semua yang ada ───────────────────────────────────
     DISIPLIN_LIST = ["Electrical", "Instrument", "Rotating", "Stationary", "Alat Berat"]
     for d in DISIPLIN_LIST:
         if re.search(r'\b' + d + r'\b', raw_text, re.IGNORECASE):
-            header["disiplin"] = d
-            break
+            header["disiplin"].append(d)
+    # Tangkap "INSTRUMENTASI" → "Instrument"
+    if re.search(r'\bINSTRUMENTASI\b', raw_text, re.IGNORECASE):
+        if "Instrument" not in header["disiplin"]:
+            header["disiplin"].append("Instrument")
 
-    # ── Direksi / Area ────────────────────────────────────────────────────────
+    # ── Direksi / Area ─────────────────────────────────────────────────────────
     DIREKSI_MAP = {
         r'\bMA\s*7\b': "MA7", r'\bMA\s*6\b': "MA6", r'\bMA\s*5\b': "MA5",
         r'[Mm]aintenance\s+[Aa]rea\s*7': "MA7",
@@ -488,43 +527,131 @@ def extract_laporan_header(raw_text: str) -> dict:
 
 def split_laporan_to_chunks(raw_text: str) -> list:
     """
-    Potong teks laporan per section/kategori agar tiap chunk kecil
-    dan AI tidak 'lupa' item di tengah proses parsing.
+    Potong teks laporan secara hierarkis: disiplin → kategori.
+    Setiap chunk membawa header disiplinnya sendiri sehingga AI
+    dapat men-tag disiplin dengan benar.
+    Chunk yang terlalu besar (>MAX_ITEMS_PER_CHUNK baris item)
+    dipecah otomatis agar tidak melebihi max_tokens output.
     Mengembalikan list of (header_text, chunk_text).
     """
+    DISIPLIN_PATTERNS = {
+        "Rotating":   r'^ROTATING\s*$',
+        "Stationary": r'^STATIONARY\s*$',
+        "Electrical": r'^ELECTRICAL\s*$',
+        "Instrument": r'^INSTRUMENTASI\s*$|^INSTRUMENT\s*$',
+        "Alat Berat": r'^ALAT\s*BERAT\s*$',
+    }
     CATEGORY_KEYWORDS = [
         "Plant Patrol", "Preventive Maintenance", "Corrective Maintenance",
-        "Progress", "Challenge Session", "Project"
+        "Progress", "Challenge Session", "Project", "Support",
     ]
-    # Hanya match di awal baris (setelah newline atau awal teks)
-    pattern = r'(?:(?<=\n)|(?<=\r\n)|(?:^))(?=' + '|'.join(re.escape(k) for k in CATEGORY_KEYWORDS) + r')'
-    parts = re.split(pattern, raw_text, flags=re.IGNORECASE | re.MULTILINE)
+    MAX_ITEMS_PER_CHUNK = 25
 
-    header_lines = []
-    chunks = []
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        is_category = any(
-            part.lower().startswith(k.lower()) for k in CATEGORY_KEYWORDS
-        )
-        if is_category:
-            chunks.append(part)
+    lines = raw_text.splitlines()
+
+    # ── Pecah per disiplin ─────────────────────────────────────────────────────
+    sections = []          # list of (disiplin_str, lines_list)
+    current_disiplin = ""
+    current_lines    = []
+
+    for line in lines:
+        stripped = line.strip()
+        matched_disiplin = None
+        for d, pat in DISIPLIN_PATTERNS.items():
+            if re.match(pat, stripped, re.IGNORECASE):
+                matched_disiplin = d
+                break
+
+        if matched_disiplin:
+            if current_lines:
+                sections.append((current_disiplin, current_lines))
+            current_disiplin = matched_disiplin
+            current_lines    = [line]
         else:
-            header_lines.append(part)
+            current_lines.append(line)
 
-    header_text = "\n".join(header_lines)
+    if current_lines:
+        sections.append((current_disiplin, current_lines))
 
-    if not chunks:
-        # Tidak ada kategori ditemukan — kirim seluruhnya sebagai 1 chunk
-        return [(header_text, raw_text)]
+    # ── Fallback: tidak ada penanda disiplin → logika lama (split per kategori) ─
+    has_discipline = any(d for d, _ in sections)
+    if not has_discipline:
+        cat_pattern = (
+            r'(?:(?<=\n)|(?:^))(?='
+            + '|'.join(re.escape(k) for k in CATEGORY_KEYWORDS)
+            + r')'
+        )
+        parts = re.split(cat_pattern, raw_text, flags=re.IGNORECASE | re.MULTILINE)
+        header_lines, chunks_old = [], []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if any(part.lower().startswith(k.lower()) for k in CATEGORY_KEYWORDS):
+                chunks_old.append(part)
+            else:
+                header_lines.append(part)
+        header_text = "\n".join(header_lines)
+        if not chunks_old:
+            return [(header_text, raw_text)]
+        return [(header_text, c) for c in chunks_old]
 
-    return [(header_text, chunk) for chunk in chunks]
+    # ── Pisahkan header global (baris sebelum disiplin pertama) ───────────────
+    global_header = ""
+    if sections and not sections[0][0]:
+        global_header = "\n".join(sections[0][1]).strip()
+        sections = sections[1:]
+
+    # ── Per section disiplin, pecah lagi per kategori ─────────────────────────
+    result_chunks = []
+
+    for disiplin, disc_lines in sections:
+        disc_text = "\n".join(disc_lines)
+
+        cat_pattern = (
+            r'(?:(?<=\n)|(?:^))(?='
+            + '|'.join(re.escape(k) for k in CATEGORY_KEYWORDS)
+            + r')'
+        )
+        parts = re.split(cat_pattern, disc_text, flags=re.IGNORECASE | re.MULTILINE)
+
+        disc_header_parts, cat_chunks = [], []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if any(part.lower().startswith(k.lower()) for k in CATEGORY_KEYWORDS):
+                cat_chunks.append(part)
+            else:
+                disc_header_parts.append(part)
+
+        disc_header    = "\n".join(disc_header_parts).strip()
+        combined_header = "\n".join(filter(None, [global_header, disc_header]))
+
+        if not cat_chunks:
+            result_chunks.append((combined_header, disc_text))
+            continue
+
+        for cat_chunk in cat_chunks:
+            # Pecah chunk besar menjadi beberapa batch
+            item_lines = [
+                l for l in cat_chunk.splitlines()
+                if re.match(r'^\s*[\d\*\-•]', l)
+            ]
+            if len(item_lines) > MAX_ITEMS_PER_CHUNK:
+                cat_header_line = cat_chunk.splitlines()[0]
+                for i in range(0, len(item_lines), MAX_ITEMS_PER_CHUNK):
+                    batch     = item_lines[i:i + MAX_ITEMS_PER_CHUNK]
+                    sub_chunk = cat_header_line + "\n" + "\n".join(batch)
+                    result_chunks.append((combined_header, sub_chunk))
+            else:
+                result_chunks.append((combined_header, cat_chunk))
+
+    return result_chunks
 
 
 def parse_chunk_with_ai(header_text: str, chunk_text: str) -> list:
-    """Parse satu chunk (satu kategori) dengan AI."""
+    """Parse satu chunk (satu kategori/disiplin) dengan AI."""
     combined = f"{header_text}\n\n{chunk_text}" if header_text else chunk_text
     try:
         response = call_ai([
@@ -538,7 +665,16 @@ def parse_chunk_with_ai(header_text: str, chunk_text: str) -> list:
             return []
 
         parsed = json.loads(json_match.group())
-        return parsed if isinstance(parsed, list) else []
+        if not isinstance(parsed, list):
+            return []
+
+        # Filter entri sampah/placeholder
+        clean = [item for item in parsed if not is_junk_entry(item)]
+        filtered_count = len(parsed) - len(clean)
+        if filtered_count:
+            print(f"[PARSE CHUNK] Dibuang {filtered_count} entri sampah/placeholder")
+
+        return clean
 
     except Exception as e:
         print(f"[PARSE CHUNK ERROR] {e}")
@@ -547,8 +683,8 @@ def parse_chunk_with_ai(header_text: str, chunk_text: str) -> list:
 
 def parse_laporan_with_ai(raw_text: str) -> list:
     """
-    Parse laporan dengan chunking otomatis per kategori.
-    Setiap kategori diparse terpisah lalu digabungkan.
+    Parse laporan dengan chunking hierarkis per disiplin → kategori.
+    Setiap chunk diparse terpisah lalu digabungkan.
     """
     chunks = split_laporan_to_chunks(raw_text)
     print(f"[PARSE LAPORAN] Total chunks: {len(chunks)}")
@@ -561,7 +697,7 @@ def parse_laporan_with_ai(raw_text: str) -> list:
         print(f"[PARSE LAPORAN] Chunk {i+1} → {len(items)} item")
         all_items.extend(items)
 
-    # Deduplikasi berdasarkan kombinasi tanggal+disiplin+deskripsi
+    # Deduplikasi: tanggal + disiplin + tag_number + deskripsi
     seen = set()
     unique_items = []
     for item in all_items:
@@ -569,7 +705,7 @@ def parse_laporan_with_ai(raw_text: str) -> list:
             item.get("tanggal_laporan", ""),
             item.get("disiplin", ""),
             item.get("tag_number", "").strip().lower(),
-            item.get("deskripsi", "").strip().lower()
+            item.get("deskripsi", "").strip().lower(),
         )
         if key not in seen:
             seen.add(key)
@@ -580,15 +716,61 @@ def parse_laporan_with_ai(raw_text: str) -> list:
 
 
 def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
+    """
+    Simpan items ke daily_report.
+    Return: (success_count, error_msg | None, dup_warnings_list)
+    """
     if not items:
-        return 0, "Tidak ada item yang bisa diparse"
+        return 0, "Tidak ada item yang bisa diparse", []
+
+    # Fallback direksi dari raw_text kalau item tidak punya
+    fallback_direksi = ""
+    DIREKSI_MAP_FB = {
+        r'\bMA\s*7\b': "MA7", r'\bMA\s*6\b': "MA6", r'\bMA\s*5\b': "MA5",
+        r'[Mm]aintenance\s+[Aa]rea\s*7': "MA7",
+        r'[Mm]aintenance\s+[Aa]rea\s*6': "MA6",
+        r'[Mm]aintenance\s+[Aa]rea\s*5': "MA5",
+        r'\bWorkshop\b': "Workshop",
+    }
+    for pat, val in DIREKSI_MAP_FB.items():
+        if re.search(pat, raw_text):
+            fallback_direksi = val
+            break
+
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur  = conn.cursor()
-        success = 0
+        success      = 0
+        skipped      = 0
+        dup_warnings = []
+
         for item in items:
             if not item.get("tanggal_laporan") or not item.get("disiplin") or not item.get("deskripsi"):
+                skipped += 1
                 continue
+
+            # Fallback direksi jika kosong
+            direksi = item.get("direksi", "") or fallback_direksi
+
+            # Cek duplikat di DB
+            cur.execute("""
+                SELECT id_report FROM daily_report
+                WHERE tanggal_laporan = %s
+                  AND disiplin        = %s
+                  AND tag_number      = %s
+                  AND deskripsi       = %s
+                LIMIT 1
+            """, (
+                item.get("tanggal_laporan"),
+                item.get("disiplin", "-"),
+                item.get("tag_number", ""),
+                item.get("deskripsi", "-"),
+            ))
+            if cur.fetchone():
+                label = item.get("tag_number") or item.get("deskripsi", "?")[:30]
+                dup_warnings.append(label)
+                continue
+
             cur.execute("""
                 INSERT INTO daily_report
                     (tanggal_laporan, disiplin, direksi, kategori, tag_number, deskripsi,
@@ -596,29 +778,32 @@ def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 item.get("tanggal_laporan"),
-                item.get("disiplin", "-"),
-                item.get("direksi", ""),
-                item.get("kategori", "-"),
-                item.get("tag_number", ""),
-                item.get("deskripsi", "-"),
-                item.get("status_pekerjaan", "-"),
-                item.get("catatan", ""),
+                item.get("disiplin",        "-"),
+                direksi,
+                item.get("kategori",        "-"),
+                item.get("tag_number",      ""),
+                item.get("deskripsi",       "-"),
+                item.get("status_pekerjaan","-"),
+                item.get("catatan",         ""),
                 pengirim,
-                raw_text
+                raw_text,
             ))
             success += 1
+
         conn.commit()
         conn.close()
-        return success, None
+        if skipped:
+            print(f"[INSERT LAPORAN] {skipped} item dilewati (field wajib kosong)")
+        return success, None, dup_warnings
+
     except Exception as e:
         print(f"[INSERT LAPORAN ERROR] {e}")
-        return 0, str(e)
+        return 0, str(e), []
 
 
 def process_laporan(raw_text: str, pengirim: str) -> str:
     print(f"[LAPORAN] Memproses dari {pengirim}, panjang: {len(raw_text)} karakter")
 
-    # Ekstrak header dulu untuk info ke user
     header   = extract_laporan_header(raw_text)
     chunks   = split_laporan_to_chunks(raw_text)
     n_chunks = len(chunks)
@@ -631,32 +816,40 @@ def process_laporan(raw_text: str, pengirim: str) -> str:
             "• Ada tanggal (contoh: 03/06/2026 atau 3 Juni 2026)\n"
             "• Ada disiplin (Electrical/Instrument/Rotating/Stationary/Alat Berat)\n"
             "• Ada kategori pekerjaan (Plant Patrol / Preventive / Corrective / Project)\n"
-            "• Ada daftar item pekerjaan bernomor\n\n"
+            "• Ada daftar item pekerjaan\n\n"
             "Coba kirim ulang dengan format yang lebih jelas."
         )
 
-    success_count, error = insert_daily_report(items, pengirim, raw_text)
+    success_count, error, dup_warnings = insert_daily_report(items, pengirim, raw_text)
     if error:
         return f"⚠️ *Gagal menyimpan laporan:* {error}"
-    if success_count == 0:
+    if success_count == 0 and not dup_warnings:
         return "⚠️ *Tidak ada data yang berhasil disimpan.* Periksa format laporan."
 
     # Ringkasan per kategori
     summary = {}
-    for item in items[:success_count]:
+    for item in items:
         key = f"{item.get('disiplin', '-')} — {item.get('kategori', '-')}"
         summary[key] = summary.get(key, 0) + 1
     summary_lines = "\n".join([f"  • {k}: {v} item" for k, v in summary.items()])
 
-    # Info tanggal & area dari header
-    tgl_info   = f"📅 *Tanggal:* {header['tanggal']}\n" if header["tanggal"] else ""
-    area_info  = f"🏭 *Area:* {header['direksi']} — {header['disiplin']}\n" if header["direksi"] else ""
-    chunk_info = f"🔀 *Diproses dalam:* {n_chunks} bagian\n" if n_chunks > 1 else ""
+    disiplin_str = ", ".join(header["disiplin"]) if header["disiplin"] else "-"
+    tgl_info     = f"📅 *Tanggal:* {header['tanggal']}\n"              if header["tanggal"]  else ""
+    area_info    = f"🏭 *Area:* {header['direksi']} — {disiplin_str}\n" if header["direksi"]  else ""
+    chunk_info   = f"🔀 *Diproses dalam:* {n_chunks} bagian\n"          if n_chunks > 1       else ""
+
+    # Info duplikat
+    dup_info = ""
+    if dup_warnings:
+        dup_list = ", ".join(dup_warnings[:5])
+        lebih    = f" (+{len(dup_warnings)-5} lainnya)" if len(dup_warnings) > 5 else ""
+        dup_info = f"\n⚠️ *Duplikat dilewati ({len(dup_warnings)} item):* _{dup_list}{lebih}_\n"
 
     return (
         f"✅ *Laporan berhasil disimpan!*\n\n"
         f"{tgl_info}{area_info}{chunk_info}\n"
-        f"📋 *Total:* {success_count} kegiatan tercatat\n\n"
+        f"📋 *Total:* {success_count} kegiatan tercatat\n"
+        f"{dup_info}\n"
         f"*Rincian per kategori:*\n{summary_lines}\n\n"
         f"_Data tersimpan di database dan bisa ditanyakan kapan saja._"
     )
