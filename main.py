@@ -743,6 +743,7 @@ def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
         success      = 0
         skipped      = 0
         dup_warnings = []
+        saved_items  = []
 
         for item in items:
             if not item.get("tanggal_laporan") or not item.get("disiplin") or not item.get("deskripsi"):
@@ -788,13 +789,14 @@ def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
                 pengirim,
                 raw_text,
             ))
+            saved_items.append(item)
             success += 1
 
         conn.commit()
         conn.close()
         if skipped:
             print(f"[INSERT LAPORAN] {skipped} item dilewati (field wajib kosong)")
-        return success, None, dup_warnings
+        return success, None, dup_warnings, saved_items
 
     except Exception as e:
         print(f"[INSERT LAPORAN ERROR] {e}")
@@ -820,7 +822,7 @@ def process_laporan(raw_text: str, pengirim: str) -> str:
             "Coba kirim ulang dengan format yang lebih jelas."
         )
 
-    success_count, error, dup_warnings = insert_daily_report(items, pengirim, raw_text)
+    success_count, error, dup_warnings, saved_items = insert_daily_report(items, pengirim, raw_text)
     if error:
         return f"⚠️ *Gagal menyimpan laporan:* {error}"
     if success_count == 0 and not dup_warnings:
@@ -828,7 +830,7 @@ def process_laporan(raw_text: str, pengirim: str) -> str:
 
     # Ringkasan per kategori
     summary = {}
-    for item in items:
+    for item in saved_items:
         key = f"{item.get('disiplin', '-')} — {item.get('kategori', '-')}"
         summary[key] = summary.get(key, 0) + 1
     summary_lines = "\n".join([f"  • {k}: {v} item" for k, v in summary.items()])
