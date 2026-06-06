@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from telegram.constants import ChatAction
-
+ 
 # ─── 1. LOAD CONFIGURATION ────────────────────────────────────────────────────
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -568,6 +568,7 @@ def parse_laporan_with_ai(raw_text: str) -> list:
         key = (
             item.get("tanggal_laporan", ""),
             item.get("disiplin", ""),
+            item.get("tag_number", "").strip().lower(),
             item.get("deskripsi", "").strip().lower()
         )
         if key not in seen:
